@@ -1,0 +1,533 @@
+From 8eb8155282e7137827793b8f143f32e10f30fa26 Mon Sep 17 00:00:00 2001
+From: gertjan <mail@gjkromhout.nl>
+Date: Thu, 19 Nov 2026 22:49:50 +0100
+Subject: [PATCH 4/4] mfreadwrite: Encode samples and implement
+ IMFSinkWriter::Finalize().
+
+Run written samples through the converter and encoder transforms instead of passing raw frames to the stream sink, set the encoder input type when a converter is inserted, and implement Finalize(): drain the transforms, wait for the sink to consume queued samples, finalize and shut down the media sink.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dlls/mfreadwrite/writer.c | 393 ++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 376 insertions(+), 17 deletions(-)
+
+diff --git a/dlls/mfreadwrite/writer.c b/dlls/mfreadwrite/writer.c
+index 88d523a..a744ef8 100644
+--- a/dlls/mfreadwrite/writer.c
++++ b/dlls/mfreadwrite/writer.c
+@@ -35,8 +35,12 @@ enum writer_state
+ {
+     SINK_WRITER_STATE_INITIAL = 0,
+     SINK_WRITER_STATE_WRITING,
++    SINK_WRITER_STATE_FINALIZED,
+ };
+ 
++/* How long Finalize() waits for the media sink to make progress before giving up. */
++#define SINK_WRITER_FINALIZE_TIMEOUT_MS 10000
++
+ struct marker_context
+ {
+     IUnknown IUnknown_iface;
+@@ -67,6 +71,7 @@ struct sink_writer
+ {
+     IMFSinkWriterEx IMFSinkWriterEx_iface;
+     IMFAsyncCallback events_callback;
++    IMFAsyncCallback finalize_callback;
+     LONG refcount;
+ 
+     struct
+@@ -86,6 +91,10 @@ struct sink_writer
+     IMFAttributes *attributes;
+     IMFSinkWriterCallback *callback;
+ 
++    HANDLE sink_event;     /* Signaled when the sink requests a sample. */
++    HANDLE finalize_event; /* Signaled when the media sink finished finalizing. */
++    HRESULT finalize_status;
++
+     CRITICAL_SECTION cs;
+ };
+ 
+@@ -99,6 +108,11 @@ static struct sink_writer *impl_from_events_callback_IMFAsyncCallback(IMFAsyncCa
+     return CONTAINING_RECORD(iface, struct sink_writer, events_callback);
+ }
+ 
++static struct sink_writer *impl_from_finalize_callback_IMFAsyncCallback(IMFAsyncCallback *iface)
++{
++    return CONTAINING_RECORD(iface, struct sink_writer, finalize_callback);
++}
++
+ static struct marker_context *impl_from_marker_context_IUnknown(IUnknown *iface)
+ {
+     return CONTAINING_RECORD(iface, struct marker_context, IUnknown_iface);
+@@ -299,6 +313,18 @@ static HRESULT stream_create_transforms(struct stream *stream,
+             /* Create the converter with a recursive call. */
+             hr = stream_create_transforms(stream, input_type, encoder_input_type, FALSE, attributes);
+             IMFMediaType_Release(encoder_input_type);
++
++            /* The encoder takes whatever the converter produces. */
++            if (SUCCEEDED(hr) && SUCCEEDED(hr = IMFTransform_GetOutputCurrentType(stream->converter, 0, &encoder_input_type)))
++            {
++                hr = IMFTransform_SetInputType(transform, 0, encoder_input_type, 0);
++                IMFMediaType_Release(encoder_input_type);
++                if (FAILED(hr))
++                {
++                    WARN("Failed to set encoder input type, hr %#lx.\n", hr);
++                    stream_release_transforms(stream);
++                }
++            }
+             if (SUCCEEDED(hr))
+             {
+                 /* Converter is already set in the recursive call, set encoder here. */
+@@ -384,7 +410,11 @@ static ULONG WINAPI sink_writer_Release(IMFSinkWriterEx *iface)
+         if (writer->clock)
+             IMFPresentationClock_Release(writer->clock);
+         if (writer->sink)
++        {
++            if (writer->state != SINK_WRITER_STATE_FINALIZED)
++                IMFMediaSink_Shutdown(writer->sink);
+             IMFMediaSink_Release(writer->sink);
++        }
+         if (writer->attributes)
+             IMFAttributes_Release(writer->attributes);
+         if (writer->callback)
+@@ -398,6 +428,10 @@ static ULONG WINAPI sink_writer_Release(IMFSinkWriterEx *iface)
+             stream_release_transforms(stream);
+             sink_writer_drop_pending_items(stream);
+         }
++        if (writer->sink_event)
++            CloseHandle(writer->sink_event);
++        if (writer->finalize_event)
++            CloseHandle(writer->finalize_event);
+         DeleteCriticalSection(&writer->cs);
+         free(writer);
+     }
+@@ -712,12 +746,10 @@ static HRESULT sink_writer_process_sample(struct sink_writer *writer, struct str
+     return hr;
+ }
+ 
+-static HRESULT sink_writer_encode_sample(struct sink_writer *writer, struct stream *stream, IMFSample *sample)
++static HRESULT stream_queue_sample(struct stream *stream, IMFSample *sample)
+ {
+     struct pending_item *item;
+ 
+-    /* FIXME: call the encoder, queue its output */
+-
+     if (!(item = calloc(1, sizeof(*item))))
+         return E_OUTOFMEMORY;
+ 
+@@ -728,6 +760,184 @@ static HRESULT sink_writer_encode_sample(struct sink_writer *writer, struct stre
+     return S_OK;
+ }
+ 
++static unsigned int stream_get_transform_chain(struct stream *stream, IMFTransform **chain)
++{
++    unsigned int count = 0;
++
++    if (stream->converter)
++        chain[count++] = stream->converter;
++    if (stream->encoder)
++        chain[count++] = stream->encoder;
++
++    return count;
++}
++
++static HRESULT stream_allocate_output_sample(IMFTransform *transform, IMFSample **out)
++{
++    MFT_OUTPUT_STREAM_INFO info = {0};
++    IMFMediaBuffer *buffer;
++    IMFSample *sample;
++    HRESULT hr;
++
++    *out = NULL;
++
++    if (FAILED(hr = IMFTransform_GetOutputStreamInfo(transform, 0, &info)))
++        return hr;
++    if (info.dwFlags & (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES | MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES))
++        return S_OK;
++
++    if (FAILED(hr = MFCreateSample(&sample)))
++        return hr;
++    if (FAILED(hr = MFCreateAlignedMemoryBuffer(max(info.cbSize, 1),
++            info.cbAlignment ? info.cbAlignment - 1 : 0, &buffer)))
++    {
++        IMFSample_Release(sample);
++        return hr;
++    }
++    hr = IMFSample_AddBuffer(sample, buffer);
++    IMFMediaBuffer_Release(buffer);
++    if (FAILED(hr))
++    {
++        IMFSample_Release(sample);
++        return hr;
++    }
++
++    *out = sample;
++    return S_OK;
++}
++
++static HRESULT stream_push_sample(struct stream *stream, IMFTransform **chain, unsigned int count,
++        unsigned int level, IMFSample *sample);
++
++/* Pull all available output from chain[level] and push it further down the chain. */
++static HRESULT stream_pull_output(struct stream *stream, IMFTransform **chain, unsigned int count,
++        unsigned int level)
++{
++    IMFTransform *transform = chain[level];
++    MFT_OUTPUT_DATA_BUFFER output;
++    unsigned int iterations;
++    IMFMediaType *type;
++    DWORD status;
++    HRESULT hr;
++
++    for (iterations = 0; iterations < 4096; ++iterations)
++    {
++        memset(&output, 0, sizeof(output));
++        if (FAILED(hr = stream_allocate_output_sample(transform, &output.pSample)))
++            return hr;
++
++        status = 0;
++        hr = IMFTransform_ProcessOutput(transform, 0, 1, &output, &status);
++        if (output.pEvents)
++            IMFCollection_Release(output.pEvents);
++
++        if (hr == MF_E_TRANSFORM_STREAM_CHANGE)
++        {
++            if (output.pSample)
++                IMFSample_Release(output.pSample);
++            if (FAILED(hr = IMFTransform_GetOutputAvailableType(transform, 0, 0, &type)))
++                return hr;
++            hr = IMFTransform_SetOutputType(transform, 0, type, 0);
++            IMFMediaType_Release(type);
++            if (FAILED(hr))
++                return hr;
++            continue;
++        }
++
++        if (FAILED(hr))
++        {
++            if (output.pSample)
++                IMFSample_Release(output.pSample);
++            return hr == MF_E_TRANSFORM_NEED_MORE_INPUT ? S_OK : hr;
++        }
++
++        if (!output.pSample)
++            continue;
++
++        hr = stream_push_sample(stream, chain, count, level + 1, output.pSample);
++        IMFSample_Release(output.pSample);
++        if (FAILED(hr))
++            return hr;
++    }
++
++    WARN("Transform %p keeps producing output, giving up.\n", transform);
++    return S_OK;
++}
++
++/* Feed a sample to chain[level]; at the end of the chain the sample is queued for the stream sink. */
++static HRESULT stream_push_sample(struct stream *stream, IMFTransform **chain, unsigned int count,
++        unsigned int level, IMFSample *sample)
++{
++    HRESULT hr;
++
++    if (level == count)
++        return stream_queue_sample(stream, sample);
++
++    hr = IMFTransform_ProcessInput(chain[level], 0, sample, 0);
++    if (hr == MF_E_NOTACCEPTING)
++    {
++        if (FAILED(hr = stream_pull_output(stream, chain, count, level)))
++            return hr;
++        hr = IMFTransform_ProcessInput(chain[level], 0, sample, 0);
++    }
++    if (FAILED(hr))
++    {
++        WARN("Failed to process input on transform %p, hr %#lx.\n", chain[level], hr);
++        return hr;
++    }
++
++    return stream_pull_output(stream, chain, count, level);
++}
++
++/* Drain every transform of the stream, in order, queueing everything they still hold. */
++static HRESULT stream_drain_transforms(struct stream *stream)
++{
++    IMFTransform *chain[2];
++    unsigned int count, level;
++    HRESULT hr;
++
++    count = stream_get_transform_chain(stream, chain);
++    for (level = 0; level < count; ++level)
++    {
++        IMFTransform_ProcessMessage(chain[level], MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
++        IMFTransform_ProcessMessage(chain[level], MFT_MESSAGE_COMMAND_DRAIN, 0);
++        if (FAILED(hr = stream_pull_output(stream, chain, count, level)))
++            return hr;
++    }
++
++    return S_OK;
++}
++
++static HRESULT sink_writer_encode_sample(struct sink_writer *writer, struct stream *stream, IMFSample *sample)
++{
++    IMFTransform *chain[2];
++    unsigned int count;
++
++    count = stream_get_transform_chain(stream, chain);
++    return stream_push_sample(stream, chain, count, 0, sample);
++}
++
++/* Send queued samples to the stream sink for as long as it has outstanding requests. */
++static HRESULT sink_writer_process_pending(struct sink_writer *writer, struct stream *stream)
++{
++    struct pending_item *item;
++    HRESULT hr = S_OK;
++
++    while (SUCCEEDED(hr) && stream->stats.dwNumOutstandingSinkSampleRequests && !list_empty(&stream->queue))
++    {
++        item = LIST_ENTRY(list_head(&stream->queue), struct pending_item, entry);
++        if (!item->sample)
++        {
++            sink_writer_place_marker(writer, stream, item->marker_type, item->timestamp, item->user_context);
++            sink_writer_release_pending_item(item);
++            continue;
++        }
++        hr = sink_writer_process_sample(writer, stream);
++    }
++
++    return hr;
++}
++
+ static HRESULT sink_writer_write_sample(struct sink_writer *writer, struct stream *stream, IMFSample *sample)
+ {
+     LONGLONG timestamp;
+@@ -746,10 +956,7 @@ static HRESULT sink_writer_write_sample(struct sink_writer *writer, struct strea
+ 
+     if (FAILED(hr = sink_writer_encode_sample(writer, stream, sample))) return hr;
+ 
+-    if (stream->stats.dwNumOutstandingSinkSampleRequests)
+-        hr = sink_writer_process_sample(writer, stream);
+-
+-    return hr;
++    return sink_writer_process_pending(writer, stream);
+ }
+ 
+ static HRESULT WINAPI sink_writer_WriteSample(IMFSinkWriterEx *iface, DWORD index, IMFSample *sample)
+@@ -775,14 +982,6 @@ static HRESULT WINAPI sink_writer_WriteSample(IMFSinkWriterEx *iface, DWORD inde
+     }
+     else if (SUCCEEDED(hr = sink_writer_get_buffer_length(sample, &timestamp, &length)))
+     {
+-        stream->stats.llLastTimestampReceived = timestamp;
+-        stream->stats.qwNumSamplesReceived++;
+-        stream->stats.dwByteCountQueued += length;
+-
+-        writer->stats.llLastTimestampReceived = timestamp;
+-        writer->stats.qwNumSamplesReceived++;
+-        writer->stats.dwByteCountQueued += length;
+-
+         hr = sink_writer_write_sample(writer, stream, sample);
+     }
+ 
+@@ -900,11 +1099,128 @@ static HRESULT WINAPI sink_writer_Flush(IMFSinkWriterEx *iface, DWORD index)
+     return hr;
+ }
+ 
++/* Wait until every queued sample was delivered to, and consumed by, the stream sinks.
++ * A stream sink requests a new sample after it processed the previous one, so a stream
++ * is idle once its queue is empty and it has an outstanding request. */
++static HRESULT sink_writer_wait_for_sink(struct sink_writer *writer)
++{
++    unsigned int i;
++    BOOL done;
++    HRESULT hr;
++
++    for (;;)
++    {
++        EnterCriticalSection(&writer->cs);
++        done = TRUE;
++        for (i = 0; i < writer->streams.count; ++i)
++        {
++            struct stream *stream = &writer->streams.items[i];
++
++            sink_writer_process_pending(writer, stream);
++            if (!list_empty(&stream->queue) || !stream->stats.dwNumOutstandingSinkSampleRequests)
++                done = FALSE;
++        }
++        hr = writer->status;
++        LeaveCriticalSection(&writer->cs);
++
++        if (done || FAILED(hr))
++            return hr;
++
++        if (WaitForSingleObject(writer->sink_event, SINK_WRITER_FINALIZE_TIMEOUT_MS) != WAIT_OBJECT_0)
++        {
++            WARN("Timed out waiting for the media sink to consume queued samples.\n");
++            return HRESULT_FROM_WIN32(ERROR_TIMEOUT);
++        }
++    }
++}
++
++static HRESULT sink_writer_finalize_sink(struct sink_writer *writer)
++{
++    IMFFinalizableMediaSink *sink;
++    HRESULT hr;
++
++    if (FAILED(IMFMediaSink_QueryInterface(writer->sink, &IID_IMFFinalizableMediaSink, (void **)&sink)))
++        return S_OK;
++
++    ResetEvent(writer->finalize_event);
++    writer->finalize_status = E_PENDING;
++    if (SUCCEEDED(hr = IMFFinalizableMediaSink_BeginFinalize(sink, &writer->finalize_callback, (IUnknown *)sink)))
++    {
++        if (WaitForSingleObject(writer->finalize_event, SINK_WRITER_FINALIZE_TIMEOUT_MS) == WAIT_OBJECT_0)
++            hr = writer->finalize_status;
++        else
++        {
++            WARN("Timed out waiting for the media sink to finalize.\n");
++            hr = HRESULT_FROM_WIN32(ERROR_TIMEOUT);
++        }
++    }
++
++    IMFFinalizableMediaSink_Release(sink);
++    return hr;
++}
++
+ static HRESULT WINAPI sink_writer_Finalize(IMFSinkWriterEx *iface)
+ {
+-    FIXME("%p.\n", iface);
++    struct sink_writer *writer = impl_from_IMFSinkWriterEx(iface);
++    HRESULT hr = S_OK, tmp_hr;
++    unsigned int i;
+ 
+-    return E_NOTIMPL;
++    TRACE("%p.\n", iface);
++
++    EnterCriticalSection(&writer->cs);
++
++    if (writer->state != SINK_WRITER_STATE_WRITING)
++    {
++        LeaveCriticalSection(&writer->cs);
++        return MF_E_INVALIDREQUEST;
++    }
++
++    /* No more samples are accepted from now on. */
++    writer->state = SINK_WRITER_STATE_FINALIZED;
++
++    for (i = 0; i < writer->streams.count; ++i)
++    {
++        struct stream *stream = &writer->streams.items[i];
++
++        if (FAILED(tmp_hr = stream_drain_transforms(stream)))
++        {
++            WARN("Failed to drain stream %u, hr %#lx.\n", i, tmp_hr);
++            if (SUCCEEDED(hr)) hr = tmp_hr;
++        }
++        sink_writer_process_pending(writer, stream);
++    }
++
++    LeaveCriticalSection(&writer->cs);
++
++    /* Waiting is done without holding the lock, sink events need it. */
++    if (FAILED(tmp_hr = sink_writer_wait_for_sink(writer)) && SUCCEEDED(hr))
++        hr = tmp_hr;
++
++    if (FAILED(tmp_hr = sink_writer_finalize_sink(writer)))
++    {
++        WARN("Failed to finalize the media sink, hr %#lx.\n", tmp_hr);
++        if (SUCCEEDED(hr)) hr = tmp_hr;
++    }
++
++    EnterCriticalSection(&writer->cs);
++
++    if (writer->clock)
++        IMFPresentationClock_Stop(writer->clock);
++
++    /* Shutting down the sink closes the output file and releases pending event callbacks. */
++    IMFMediaSink_Shutdown(writer->sink);
++
++    for (i = 0; i < writer->streams.count; ++i)
++        sink_writer_drop_pending_items(&writer->streams.items[i]);
++
++    LeaveCriticalSection(&writer->cs);
++
++    if (writer->callback)
++        IMFSinkWriterCallback_OnFinalize(writer->callback, hr);
++
++    TRACE("Finalized, hr %#lx.\n", hr);
++
++    return hr;
+ }
+ 
+ static HRESULT sink_writer_get_service(void *object, REFGUID service, REFIID riid, void **ret)
+@@ -1151,6 +1467,7 @@ static HRESULT WINAPI sink_writer_events_callback_Invoke(IMFAsyncCallback *iface
+                 stream->stats.dwNumOutstandingSinkSampleRequests++;
+ 
+                 sink_writer_process_sample(writer, stream);
++                SetEvent(writer->sink_event);
+ 
+                 break;
+ 
+@@ -1189,6 +1506,40 @@ static const IMFAsyncCallbackVtbl sink_writer_events_callback_vtbl =
+     sink_writer_events_callback_Invoke,
+ };
+ 
++static ULONG WINAPI sink_writer_finalize_callback_AddRef(IMFAsyncCallback *iface)
++{
++    struct sink_writer *writer = impl_from_finalize_callback_IMFAsyncCallback(iface);
++    return IMFSinkWriterEx_AddRef(&writer->IMFSinkWriterEx_iface);
++}
++
++static ULONG WINAPI sink_writer_finalize_callback_Release(IMFAsyncCallback *iface)
++{
++    struct sink_writer *writer = impl_from_finalize_callback_IMFAsyncCallback(iface);
++    return IMFSinkWriterEx_Release(&writer->IMFSinkWriterEx_iface);
++}
++
++static HRESULT WINAPI sink_writer_finalize_callback_Invoke(IMFAsyncCallback *iface, IMFAsyncResult *result)
++{
++    struct sink_writer *writer = impl_from_finalize_callback_IMFAsyncCallback(iface);
++    IMFFinalizableMediaSink *sink = (IMFFinalizableMediaSink *)IMFAsyncResult_GetStateNoAddRef(result);
++
++    TRACE("%p, %p.\n", iface, result);
++
++    writer->finalize_status = IMFFinalizableMediaSink_EndFinalize(sink, result);
++    SetEvent(writer->finalize_event);
++
++    return S_OK;
++}
++
++static const IMFAsyncCallbackVtbl sink_writer_finalize_callback_vtbl =
++{
++    sink_writer_callback_QueryInterface,
++    sink_writer_finalize_callback_AddRef,
++    sink_writer_finalize_callback_Release,
++    sink_writer_callback_GetParameters,
++    sink_writer_finalize_callback_Invoke,
++};
++
+ static HRESULT sink_writer_initialize_existing_streams(struct sink_writer *writer, IMFMediaSink *sink)
+ {
+     IMFStreamSink *stream_sink;
+@@ -1225,12 +1576,20 @@ HRESULT create_sink_writer_from_sink(IMFMediaSink *sink, IMFAttributes *attribut
+ 
+     object->IMFSinkWriterEx_iface.lpVtbl = &sink_writer_vtbl;
+     object->events_callback.lpVtbl = &sink_writer_events_callback_vtbl;
++    object->finalize_callback.lpVtbl = &sink_writer_finalize_callback_vtbl;
+     object->refcount = 1;
+     object->sink = sink;
+     IMFMediaSink_AddRef(sink);
+     object->stats.cb = sizeof(object->stats);
+     InitializeCriticalSection(&object->cs);
+ 
++    if (!(object->sink_event = CreateEventW(NULL, FALSE, FALSE, NULL))
++            || !(object->finalize_event = CreateEventW(NULL, TRUE, FALSE, NULL)))
++    {
++        IMFSinkWriterEx_Release(&object->IMFSinkWriterEx_iface);
++        return HRESULT_FROM_WIN32(GetLastError());
++    }
++
+     if (attributes)
+     {
+         IMFAttributes_AddRef((object->attributes = attributes));
+-- 
+2.56.0
+

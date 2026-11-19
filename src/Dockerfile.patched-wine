@@ -1,0 +1,54 @@
+# Builds a netbrain/zwift image with a patched Wine, see docs/advanced/patched-wine.md.
+#
+# Build it with src/build-patched-image.sh, or directly:
+#   docker build -f src/Dockerfile.patched-wine -t localhost/zwift-patched:latest src
+#   docker build -f src/Dockerfile.patched-wine --build-arg WINE_BLE=1 -t localhost/zwift-patched:latest src
+ARG BASE_IMAGE=docker.io/netbrain/zwift:latest
+ARG DEBIAN_VERSION=trixie
+
+FROM ${BASE_IMAGE} AS base
+
+# The patched modules have to match the Wine build of the base image.
+RUN wine --version > /tmp/wine-version
+
+FROM debian:${DEBIAN_VERSION} AS wine-build
+
+ARG WINE_BLE=0
+
+# Install build dependencies
+# - WINE_BLE=0: mingw and gstreamer headers are enough for the patched PE modules
+# - WINE_BLE=1: everything Debian uses to build wine, for a full WoW64 build
+RUN sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/debian.sources \
+ && dpkg --add-architecture i386 \
+ && DEBIAN_FRONTEND="noninteractive" apt-get update \
+ && if [ "${WINE_BLE}" = "1" ]; then \
+        DEBIAN_FRONTEND="noninteractive" apt-get build-dep -y wine; \
+    fi \
+ && DEBIAN_FRONTEND="noninteractive" apt-get install --no-install-recommends -y \
+        bison ca-certificates flex g++ gcc gcc-mingw-w64-i686 gcc-mingw-w64-x86-64 git make perl pkg-config \
+        libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY --from=base /tmp/wine-version /tmp/wine-version
+COPY wine-patches/ /usr/src/wine-patches/
+COPY build-patched-wine.sh /usr/local/bin/build-patched-wine.sh
+RUN chmod 755 /usr/local/bin/build-patched-wine.sh \
+ && WINE_BLE="${WINE_BLE}" build-patched-wine.sh
+
+FROM ${BASE_IMAGE}
+
+ARG WINE_BLE=0
+
+COPY --from=wine-build /wine-install/ /
+
+# A full Wine build changes the builtin dll list, so the prefix gets updated on first launch. That update
+# also registers mscoree.dll, which pops up a .NET 2.0 dialog unless the latest CLR is forced (Wine bug 41727).
+RUN if [ "${WINE_BLE}" = "1" ]; then \
+        sed -i '/^\[Software\\\\Microsoft\\\\.NETFramework\]/a "OnlyUseLatestCLR"=dword:00000001' "${WINEPREFIX}/system.reg" \
+     && chown user:user "${WINEPREFIX}/system.reg"; \
+    fi \
+ && cat /opt/wine-devel/PATCHED \
+ && wine --version
+
+LABEL org.opencontainers.image.title="netbrain/zwift (patched wine)"
+LABEL org.opencontainers.image.description="netbrain/zwift with a patched Wine: working video screenshots, optional native bluetooth"

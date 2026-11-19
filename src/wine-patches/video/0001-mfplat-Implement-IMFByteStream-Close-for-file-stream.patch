@@ -1,0 +1,44 @@
+From 06ed2d1082990473af7201d2af3d2e2b703d216e Mon Sep 17 00:00:00 2001
+From: gertjan <mail@gjkromhout.nl>
+Date: Thu, 19 Nov 2026 22:49:50 +0100
+Subject: [PATCH 1/4] mfplat: Implement IMFByteStream::Close() for file
+ streams.
+
+Close the file handle right away instead of waiting for the last reference to go away, so the file can be reopened. Applications such as ZwiftApp write consecutive clips to the same file name and failed with a sharing violation.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dlls/mfplat/main.c | 16 ++++++++++++++--
+ 1 file changed, 14 insertions(+), 2 deletions(-)
+
+diff --git a/dlls/mfplat/main.c b/dlls/mfplat/main.c
+index 23fbde3..fca2e71 100644
+--- a/dlls/mfplat/main.c
++++ b/dlls/mfplat/main.c
+@@ -4175,9 +4175,21 @@ static HRESULT WINAPI bytestream_file_Flush(IMFByteStream *iface)
+ 
+ static HRESULT WINAPI bytestream_file_Close(IMFByteStream *iface)
+ {
+-    FIXME("%p\n", iface);
++    struct bytestream *stream = impl_from_IMFByteStream(iface);
+ 
+-    return E_NOTIMPL;
++    TRACE("%p.\n", iface);
++
++    /* Release the file right away so it can be reopened, e.g. by a new sink writer. */
++    EnterCriticalSection(&stream->cs);
++    if (stream->hfile)
++    {
++        FlushFileBuffers(stream->hfile);
++        CloseHandle(stream->hfile);
++        stream->hfile = NULL;
++    }
++    LeaveCriticalSection(&stream->cs);
++
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI bytestream_SetCurrentPosition(IMFByteStream *iface, QWORD position)
+-- 
+2.56.0
+

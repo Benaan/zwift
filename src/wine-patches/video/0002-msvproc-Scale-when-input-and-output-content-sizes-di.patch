@@ -1,0 +1,85 @@
+From 82faed2e9390c9655ff81b3ea094722edb9308a2 Mon Sep 17 00:00:00 2001
+From: gertjan <mail@gjkromhout.nl>
+Date: Thu, 19 Nov 2026 22:49:50 +0100
+Subject: [PATCH 2/4] msvproc: Scale when input and output content sizes
+ differ.
+
+The output aperture was forced to the input aperture, so frames were converted at input size and written past the end of smaller output buffers. Keep separate apertures when the content sizes differ and let swscale resize.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dlls/msvproc/video_processor.c | 21 ++++++++++++++++-----
+ 1 file changed, 16 insertions(+), 5 deletions(-)
+
+diff --git a/dlls/msvproc/video_processor.c b/dlls/msvproc/video_processor.c
+index f2ad3e0..e7122af 100644
+--- a/dlls/msvproc/video_processor.c
++++ b/dlls/msvproc/video_processor.c
+@@ -493,16 +493,25 @@ static void get_mf_video_content_rect(const MFVideoInfo *info, RECT *rect)
+     }
+ }
+ 
+-static void update_video_aperture(MFVideoInfo *input_info, MFVideoInfo *output_info)
++/* Returns TRUE when the input content has to be scaled to fit the output content. */
++static BOOL update_video_aperture(MFVideoInfo *input_info, MFVideoInfo *output_info)
+ {
+     RECT input_rect, output_rect;
+ 
+     get_mf_video_content_rect(input_info, &input_rect);
+     get_mf_video_content_rect(output_info, &output_rect);
+ 
++    if (input_rect.right - input_rect.left != output_rect.right - output_rect.left
++            || input_rect.bottom - input_rect.top != output_rect.bottom - output_rect.top)
++    {
++        /* Different content sizes: keep both apertures and let swscale resize. */
++        TRACE("Scaling content %s to %s\n", wine_dbgstr_rect(&input_rect), wine_dbgstr_rect(&output_rect));
++        return TRUE;
++    }
++
+     if (!EqualRect(&input_rect, &output_rect))
+     {
+-        FIXME("Mismatched content size %s vs %s\n", wine_dbgstr_rect(&input_rect),
++        FIXME("Mismatched content offset %s vs %s\n", wine_dbgstr_rect(&input_rect),
+                 wine_dbgstr_rect(&output_rect));
+     }
+ 
+@@ -511,6 +520,7 @@ static void update_video_aperture(MFVideoInfo *input_info, MFVideoInfo *output_i
+     input_info->MinimumDisplayAperture.Area.cx = input_rect.right - input_rect.left;
+     input_info->MinimumDisplayAperture.Area.cy = input_rect.bottom - input_rect.top;
+     output_info->MinimumDisplayAperture = input_info->MinimumDisplayAperture;
++    return FALSE;
+ }
+ 
+ static HRESULT create_video_format(BOOL bottom_up, IMFMediaType *media_type, MFVIDEOFORMAT **format)
+@@ -530,6 +540,7 @@ static HRESULT create_video_format(BOOL bottom_up, IMFMediaType *media_type, MFV
+ static HRESULT video_processor_init(struct video_processor *impl)
+ {
+     BOOL bottom_up = !impl->device_manager; /* when not D3D-enabled, the transform outputs bottom up RGB buffers */
++    BOOL scale;
+     HRESULT hr;
+     int ret;
+ 
+@@ -544,7 +555,7 @@ static HRESULT video_processor_init(struct video_processor *impl)
+         return hr;
+     }
+ 
+-    update_video_aperture(&impl->input_format->videoInfo, &impl->output_format->videoInfo);
++    scale = update_video_aperture(&impl->input_format->videoInfo, &impl->output_format->videoInfo);
+ 
+     video_frame_init_from_format(&impl->input_frame, impl->input_format);
+     if ((ret = av_frame_get_buffer(&impl->input_frame, 0)) < 0)
+@@ -554,9 +565,9 @@ static HRESULT video_processor_init(struct video_processor *impl)
+     video_frame_init_from_format(&impl->output_frame, impl->output_format);
+     if ((ret = av_frame_get_buffer(&impl->output_frame, 0)) < 0)
+         goto failed;
+-    video_frame_init_aperture(&impl->output_frame, impl->input_format);
++    video_frame_init_aperture(&impl->output_frame, impl->output_format);
+ 
+-    av_opt_set(impl->context, "sws_flags", "neighbor", 0);
++    av_opt_set(impl->context, "sws_flags", scale ? "bilinear" : "neighbor", 0);
+     av_opt_set_int(impl->context, "threads", 0, 0);
+     av_opt_set_int(impl->context, "srcw", impl->input_frame.width, 0);
+     av_opt_set_int(impl->context, "srch", impl->input_frame.height, 0);
+-- 
+2.56.0
+

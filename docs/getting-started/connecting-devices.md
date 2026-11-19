@@ -14,8 +14,9 @@ ANT+ devices are not supported.
 
 ## Bluetooth
 
-Wine does not fully support Bluetooth Low Energy yet. Instead, you can [use your phone as a bridge][companion-app-bridge] to
-connect your bluetooth devices to Zwift.
+Wine does not fully support Bluetooth Low Energy yet. The [patched Wine image](../../advanced/patched-wine/) adds
+experimental native bluetooth support. Otherwise, you can [use your phone as a bridge][companion-app-bridge] to connect your
+bluetooth devices to Zwift.
 
 1. Open the Companion App on your phone (don't forget to enable bluetooth!)
 2. Start Zwift on your PC

@@ -1,0 +1,81 @@
+From 252679158867bf240ca46ee95857ad1259abc008 Mon Sep 17 00:00:00 2001
+From: gertjan <mail@gjkromhout.nl>
+Date: Thu, 19 Nov 2026 22:49:50 +0100
+Subject: [PATCH 3/4] winegstreamer: Request samples from the media sink stream
+ sinks.
+
+Send MEStreamSinkRequestSample when the sink starts and after each processed sample, like native sinks do. Without requests the sink writer never delivered samples and queued them forever. Also implement IMFStreamSink::PlaceMarker().
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dlls/winegstreamer/media_sink.c | 24 +++++++++++++++++++++---
+ 1 file changed, 21 insertions(+), 3 deletions(-)
+
+diff --git a/dlls/winegstreamer/media_sink.c b/dlls/winegstreamer/media_sink.c
+index 1e0e1d0..67fbdf7 100644
+--- a/dlls/winegstreamer/media_sink.c
++++ b/dlls/winegstreamer/media_sink.c
+@@ -364,10 +364,14 @@ static HRESULT WINAPI stream_sink_ProcessSample(IMFStreamSink *iface, IMFSample
+ static HRESULT WINAPI stream_sink_PlaceMarker(IMFStreamSink *iface, MFSTREAMSINK_MARKER_TYPE marker_type,
+         const PROPVARIANT *marker_value, const PROPVARIANT *context_value)
+ {
+-    FIXME("iface %p, marker_type %d, marker_value %p, context_value %p stub!\n",
++    struct stream_sink *stream_sink = impl_from_IMFStreamSink(iface);
++
++    TRACE("iface %p, marker_type %d, marker_value %p, context_value %p.\n",
+             iface, marker_type, marker_value, context_value);
+ 
+-    return E_NOTIMPL;
++    /* Samples are muxed synchronously once they reach the muxer, report the marker right away. */
++    return IMFMediaEventQueue_QueueEventParamVar(stream_sink->event_queue, MEStreamSinkMarker,
++            &GUID_NULL, S_OK, context_value);
+ }
+ 
+ static HRESULT WINAPI stream_sink_Flush(IMFStreamSink *iface)
+@@ -594,6 +598,7 @@ static HRESULT media_sink_write_stream(struct media_sink *media_sink)
+ 
+ static HRESULT media_sink_start(struct media_sink *media_sink)
+ {
++    BOOL was_paused = media_sink->state == STATE_PAUSED;
+     HRESULT hr;
+ 
+     if (FAILED(hr = wg_muxer_start(media_sink->muxer)))
+@@ -601,7 +606,14 @@ static HRESULT media_sink_start(struct media_sink *media_sink)
+ 
+     media_sink->state = STATE_STARTED;
+ 
+-    return media_sink_queue_stream_event(media_sink, MEStreamSinkStarted);
++    if (FAILED(hr = media_sink_queue_stream_event(media_sink, MEStreamSinkStarted)))
++        return hr;
++
++    /* Ask for the first sample of every stream. Every processed sample is followed by a new request,
++     * so a request is already outstanding when resuming from pause. */
++    if (was_paused)
++        return S_OK;
++    return media_sink_queue_stream_event(media_sink, MEStreamSinkRequestSample);
+ }
+ 
+ static HRESULT media_sink_stop(struct media_sink *media_sink)
+@@ -620,6 +632,7 @@ static HRESULT media_sink_pause(struct media_sink *media_sink)
+ static HRESULT media_sink_process(struct media_sink *media_sink, IMFSample *sample, UINT32 stream_id)
+ {
+     wg_muxer_t muxer = media_sink->muxer;
++    struct stream_sink *stream_sink;
+     struct wg_sample *wg_sample;
+     LONGLONG time, duration;
+     UINT32 value;
+@@ -651,6 +664,11 @@ static HRESULT media_sink_process(struct media_sink *media_sink, IMFSample *samp
+     hr = wg_muxer_push_sample(muxer, wg_sample, stream_id);
+     wg_sample_release(wg_sample);
+ 
++    /* Request the next sample, like native media sinks do after consuming one. */
++    if ((stream_sink = media_sink_get_stream_sink_by_id(media_sink, stream_id)))
++        IMFMediaEventQueue_QueueEventParamVar(stream_sink->event_queue, MEStreamSinkRequestSample,
++                &GUID_NULL, S_OK, NULL);
++
+     return hr;
+ }
+ 
+-- 
+2.56.0
+

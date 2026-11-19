@@ -14,7 +14,9 @@ nav_order: 4
 
 ## Solution
 
-Disable video screenshots in Zwift settings:
+Use the [patched Wine image](../../advanced/patched-wine/), it makes video screenshots work.
+
+Or disable video screenshots in Zwift settings:
 
 1. Open Zwift
 2. Go to **Settings** (menu icon in bottom left)
