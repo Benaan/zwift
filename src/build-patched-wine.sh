@@ -75,5 +75,5 @@ else
 fi
 
 echo "${wine_tag} patch sets: ${patch_sets[*]}" > "${DESTDIR}${WINE_INSTALL_PREFIX}/PATCHED"
-echo "Installed patched Wine files:"
-find "${DESTDIR}" -maxdepth 6 -type f -newer /tmp/wine-version | head -20
+file_count="$(find "${DESTDIR}" -type f | wc -l)"
+echo "Installed ${file_count} patched Wine files to ${DESTDIR}"
